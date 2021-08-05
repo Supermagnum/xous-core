@@ -1,24 +1,32 @@
+#![cfg_attr(target_os = "none", no_std)]
+#![cfg_attr(target_os = "none", no_main)]
+
 use log::info;
 use com::api::BattStats;
-use graphics_server::*;
 
 use core::fmt::Write;
 
 use blitstr_ref as blitstr;
 
 use xous::{send_message, CID, Message, msg_scalar_unpack};
-use num_traits::{ToPrimitive, FromPrimitive};
+use xous_ipc::String;
+use num_traits::*;
+
+use graphics_server::*;
+
+const SERVER_NAME_STATUS: &str   = "_Status bar manager_";
+const SERVER_NAME_STATUS_GID: &str   = "_Status bar GID receiver_";
 
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]
 enum StatusOpcode {
     // for passing battstats on to the main thread from the callback
     BattStats,
-
     // for passing DateTime
     DateTime,
-
     // indicates time for periodic update of the status bar
     Pump,
+    // exists to make clippy happy about unreachable code
+    Quit,
 }
 
 static mut CB_TO_MAIN_CONN: Option<CID> = None;
@@ -53,16 +61,38 @@ pub fn pump_thread(conn: usize) {
         ticktimer.sleep_ms(1000).unwrap();
     }
 }
+#[xous::xous_main]
+fn xmain() -> ! {
+    log_server::init_wait().unwrap();
+    log::set_max_level(log::LevelFilter::Info);
+    log::info!("my PID is {}", xous::process::id());
 
-const SERVER_NAME_STATUS: &str   = "_Status bar manager_";
-pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usize, canvas_gid_3: usize) {
-    let canvas_gid = [canvas_gid_0 as u32, canvas_gid_1 as u32, canvas_gid_2 as u32, canvas_gid_3 as u32];
+    let xns = xous_names::XousNames::new().unwrap();
+    // 1 connection exactly -- from the GAM to set our canvas GID
+    let status_gam_getter = xns.register_name(SERVER_NAME_STATUS_GID, Some(1)).expect("can't register server");
+    let mut canvas_gid: [u32; 4] = [0; 4];
+    // wait unil we're assigned a GID -- this is a one-time message from the GAM
+    let msg = xous::receive_message(status_gam_getter).unwrap();
+    log::trace!("GID assignment message: {:?}", msg);
+    xous::msg_scalar_unpack!(msg, g0, g1, g2, g3, {
+            canvas_gid[0] = g0 as u32;
+            canvas_gid[1] = g1 as u32;
+            canvas_gid[2] = g2 as u32;
+            canvas_gid[3] = g3 as u32;
+    });
+    match xns.unregister_server(status_gam_getter) {
+        Err(e) => {
+            log::error!("couldn't unregister getter server: {:?}", e);
+        }
+        _ => {}
+    }
+    xous::destroy_server(status_gam_getter).unwrap();
 
+    // ok, now that we have a GID, we can continue on with our merry way
     let status_gid: Gid = Gid::new(canvas_gid);
     log::trace!("|status: my canvas {:?}", status_gid);
 
     log::trace!("|status: registering GAM|status thread");
-    let xns = xous_names::XousNames::new().unwrap();
     // should be only one connection here, from the status main loop
     let status_sid = xns.register_name(SERVER_NAME_STATUS, Some(1)).expect("|status: can't register server");
     // create a connection for callback hooks
@@ -123,7 +153,7 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
     log::debug!("initializing RTC...");
     let mut rtc = rtc::Rtc::new(&xns).unwrap();
 
-    #[cfg(target_os = "none")]
+    #[cfg(any(target_os = "none", target_os = "xous"))]
     rtc.clear_wakeup_alarm().unwrap(); // clear any wakeup alarm state, if it was set
 
     rtc.hook_rtc_callback(dt_callback).unwrap();
@@ -163,6 +193,9 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
     }
     let mut battstats_phase = true;
     let mut needs_redraw = false;
+
+    log::debug!("starting main menu thread");
+    xous::create_thread_0(main_menu_thread).expect("couldn't create menu thread");
 
     info!("|status: starting main loop");
     loop {
@@ -214,9 +247,9 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
                     }
                 }
                 if (stats_phase % dt_pump_interval) == 2 {
-                    #[cfg(target_os = "none")]
+                    #[cfg(any(target_os = "none", target_os = "xous"))]
                     rtc.request_datetime().expect("|status: can't request datetime from RTC");
-                    #[cfg(not(target_os = "none"))]
+                    #[cfg(not(any(target_os = "none", target_os = "xous")))]
                     {
                         log::trace!("hosted request of date time - short circuiting server call");
                         use chrono::prelude::*;
@@ -283,7 +316,10 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
                 let dt = buffer.to_original::<rtc::DateTime, _>().unwrap();
                 datetime = Some(dt);
             }
-            None => {log::error!("|status: received unknown Opcode"); break}
+            Some(StatusOpcode::Quit) => {
+                break;
+            }
+            None => {log::error!("|status: received unknown Opcode");}
         }
     }
     log::trace!("status thread exit, destroying servers");
@@ -296,4 +332,119 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
     xns.unregister_server(status_sid).unwrap();
     xous::destroy_server(status_sid).unwrap();
     log::trace!("status thread quitting");
+    xous::terminate_process(0)
+}
+
+use gam::*;
+use locales::t;
+// this is the provider for the main menu, it's built into the GAM so we always have at least this
+// root-level menu available
+pub fn main_menu_thread() {
+    let mut menu = Menu::new(gam::api::MAIN_MENU_NAME);
+
+    let xns = xous_names::XousNames::new().unwrap();
+    let susres = susres::Susres::new_without_hook(&xns).unwrap();
+    let com = com::Com::new(&xns).unwrap();
+    let rtc = rtc::Rtc::new(&xns).unwrap();
+
+    let blon_item = MenuItem {
+        name: String::<64>::from_str(t!("mainmenu.backlighton", xous::LANG)),
+        action_conn: com.conn(),
+        action_opcode: com.getop_backlight(),
+        action_payload: MenuPayload::Scalar([191 >> 3, 191 >> 3, 0, 0]),
+        close_on_select: true,
+    };
+    menu.add_item(blon_item);
+
+    let bloff_item = MenuItem {
+        name: String::<64>::from_str(t!("mainmenu.backlightoff", xous::LANG)),
+        action_conn: com.conn(),
+        action_opcode: com.getop_backlight(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: true,
+    };
+    menu.add_item(bloff_item);
+
+    let sleep_item = MenuItem {
+        name: String::<64>::from_str(t!("mainmenu.sleep", xous::LANG)),
+        action_conn: susres.conn(),
+        action_opcode: susres.getop_suspend(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: true,
+    };
+    menu.add_item(sleep_item);
+
+    let keys = root_keys::RootKeys::new(&xns).expect("couldn't connect to root_keys to query initialization state");
+    if !keys.is_initialized().unwrap() {
+        let initkeys_item = MenuItem {
+            name: String::<64>::from_str(t!("mainmenu.init_keys", xous::LANG)),
+            action_conn: keys.conn(),
+            action_opcode: keys.get_try_init_keys_op(),
+            action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+            close_on_select: true,
+        };
+        menu.add_item(initkeys_item);
+    }
+
+    let setrtc_item = MenuItem {
+        name: String::<64>::from_str(t!("mainmenu.set_rtc", xous::LANG)),
+        action_conn: rtc.conn(),
+        action_opcode: rtc.getop_set_ux(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: true,
+    };
+    menu.add_item(setrtc_item);
+
+    let close_item = MenuItem {
+        name: String::<64>::from_str(t!("mainmenu.closemenu", xous::LANG)),
+        action_conn: menu.gam.conn(),
+        action_opcode: menu.gam.getop_revert_focus(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: false, // don't close because we're already closing
+    };
+    menu.add_item(close_item);
+
+    loop {
+        let msg = xous::receive_message(menu.sid).unwrap();
+        log::trace!("message: {:?}", msg);
+        match FromPrimitive::from_usize(msg.body.id()) {
+            Some(MenuOpcode::Redraw) => {
+                menu.redraw();
+            },
+            Some(MenuOpcode::Rawkeys) => msg_scalar_unpack!(msg, k1, k2, k3, k4, {
+                let keys = [
+                    if let Some(a) = core::char::from_u32(k1 as u32) {
+                        a
+                    } else {
+                        '\u{0000}'
+                    },
+                    if let Some(a) = core::char::from_u32(k2 as u32) {
+                        a
+                    } else {
+                        '\u{0000}'
+                    },
+                    if let Some(a) = core::char::from_u32(k3 as u32) {
+                        a
+                    } else {
+                        '\u{0000}'
+                    },
+                    if let Some(a) = core::char::from_u32(k4 as u32) {
+                        a
+                    } else {
+                        '\u{0000}'
+                    },
+                ];
+                menu.key_event(keys);
+            }),
+            Some(MenuOpcode::Quit) => {
+                break;
+            },
+            None => {
+                log::error!("unknown opcode {:?}", msg.body.id());
+            }
+        }
+    }
+    log::trace!("menu thread exit, destroying servers");
+    // do we want to add a deregister_ux call to the system?
+    xous::destroy_server(menu.sid).unwrap();
 }
