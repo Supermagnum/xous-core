@@ -1,24 +1,37 @@
+#![cfg_attr(target_os = "none", no_std)]
+#![cfg_attr(target_os = "none", no_main)]
+
 use log::info;
 use com::api::BattStats;
-use graphics_server::*;
 
 use core::fmt::Write;
 
 use blitstr_ref as blitstr;
 
 use xous::{send_message, CID, Message, msg_scalar_unpack};
-use num_traits::{ToPrimitive, FromPrimitive};
+use xous_ipc::String;
+use num_traits::*;
+
+use graphics_server::*;
+use locales::t;
+
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::collections::HashMap;
+
+const SERVER_NAME_STATUS: &str   = "_Status bar manager_";
+const SERVER_NAME_STATUS_GID: &str   = "_Status bar GID receiver_";
 
 #[derive(Debug, num_derive::FromPrimitive, num_derive::ToPrimitive)]
 enum StatusOpcode {
     // for passing battstats on to the main thread from the callback
     BattStats,
-
     // for passing DateTime
     DateTime,
-
     // indicates time for periodic update of the status bar
     Pump,
+    // exists to make clippy happy about unreachable code
+    Quit,
 }
 
 static mut CB_TO_MAIN_CONN: Option<CID> = None;
@@ -53,18 +66,40 @@ pub fn pump_thread(conn: usize) {
         ticktimer.sleep_ms(1000).unwrap();
     }
 }
+#[xous::xous_main]
+fn xmain() -> ! {
+    log_server::init_wait().unwrap();
+    log::set_max_level(log::LevelFilter::Info);
+    log::info!("my PID is {}", xous::process::id());
 
-const SERVER_NAME_STATUS: &str   = "_Status bar manager_";
-pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usize, canvas_gid_3: usize) {
-    let canvas_gid = [canvas_gid_0 as u32, canvas_gid_1 as u32, canvas_gid_2 as u32, canvas_gid_3 as u32];
+    let xns = xous_names::XousNames::new().unwrap();
+    // 1 connection exactly -- from the GAM to set our canvas GID
+    let status_gam_getter = xns.register_name(SERVER_NAME_STATUS_GID, Some(1)).expect("can't register server");
+    let mut canvas_gid: [u32; 4] = [0; 4];
+    // wait unil we're assigned a GID -- this is a one-time message from the GAM
+    let msg = xous::receive_message(status_gam_getter).unwrap();
+    log::trace!("GID assignment message: {:?}", msg);
+    xous::msg_scalar_unpack!(msg, g0, g1, g2, g3, {
+            canvas_gid[0] = g0 as u32;
+            canvas_gid[1] = g1 as u32;
+            canvas_gid[2] = g2 as u32;
+            canvas_gid[3] = g3 as u32;
+    });
+    match xns.unregister_server(status_gam_getter) {
+        Err(e) => {
+            log::error!("couldn't unregister getter server: {:?}", e);
+        }
+        _ => {}
+    }
+    xous::destroy_server(status_gam_getter).unwrap();
 
+    // ok, now that we have a GID, we can continue on with our merry way
     let status_gid: Gid = Gid::new(canvas_gid);
     log::trace!("|status: my canvas {:?}", status_gid);
 
     log::trace!("|status: registering GAM|status thread");
-    let xns = xous_names::XousNames::new().unwrap();
-    // should be only one connection here, from the status main loop
-    let status_sid = xns.register_name(SERVER_NAME_STATUS, Some(1)).expect("|status: can't register server");
+    // we have one connection, from the status main loop; but we make it with a local call, not using xns. so there's 0 in xns.
+    let status_sid = xns.register_name(SERVER_NAME_STATUS, Some(0)).expect("|status: can't register server");
     // create a connection for callback hooks
     unsafe{CB_TO_MAIN_CONN = Some(xous::connect(status_sid).unwrap())};
     let pump_conn = xous::connect(status_sid).unwrap();
@@ -76,7 +111,6 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
 
     log::trace!("|status: getting screen size");
     let screensize = gam.get_canvas_bounds(status_gid).expect("|status: Couldn't get canvas size");
-    //let screensize: Point = Point::new(0, 336);
 
     log::trace!("|status: building textview objects");
     // build uptime text view: left half of status bar
@@ -123,7 +157,7 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
     log::debug!("initializing RTC...");
     let mut rtc = rtc::Rtc::new(&xns).unwrap();
 
-    #[cfg(target_os = "none")]
+    #[cfg(any(target_os = "none", target_os = "xous"))]
     rtc.clear_wakeup_alarm().unwrap(); // clear any wakeup alarm state, if it was set
 
     rtc.hook_rtc_callback(dt_callback).unwrap();
@@ -143,26 +177,71 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
     security_tv.token = gam.claim_token("status").expect("couldn't request token"); // this is a shared magic word to identify this process
     security_tv.clear_area = true;
     security_tv.invert = true;
-    write!(&mut security_tv, " USB unlocked").unwrap();
+    write!(&mut security_tv, "{}", t!("secnote.startup", xous::LANG)).unwrap();
     gam.post_textview(&mut security_tv).unwrap();
     gam.redraw().unwrap();  // initial boot redraw
+
+    let sec_notes = Arc::new(Mutex::new(HashMap::new()));
+    let mut last_sec_note_index = 0;
+    let mut last_sec_note_size = 0;
+    if !debug_locked {
+        sec_notes.lock().unwrap().insert("secnote.usb_unlock".to_string(), t!("secnote.usb_unlock", xous::LANG).to_string());
+    }
+    let keys = Arc::new(Mutex::new(root_keys::RootKeys::new(&xns).expect("couldn't connect to root_keys to query initialization state")));
+    if !keys.lock().unwrap().is_initialized().unwrap() {
+        sec_notes.lock().unwrap().insert("secnotes.no_keys".to_string(), t!("secnote.no_keys", xous::LANG).to_string());
+    } else {
+        log::info!("checking gateware signature...");
+        thread::spawn({
+            let clone = Arc::clone(&sec_notes);
+            let keys = Arc::clone(&keys);
+            move || {
+                if let Some(pass) = keys.lock().unwrap().check_gateware_signature().expect("couldn't issue gateware check call") {
+                    if !pass {
+                        let mut sn = clone.lock().unwrap();
+                        sn.insert("secnotes.gateware_fail".to_string(), t!("secnote.gateware_fail", xous::LANG).to_string());
+                    }
+                } else {
+                    let mut sn = clone.lock().unwrap();
+                    sn.insert("secnotes.state_fail".to_string(), t!("secnote.state_fail", xous::LANG).to_string());
+                }
+            }
+        });
+    };
 
     let mut stats_phase: usize = 0;
 
     let dt_pump_interval = 15;
-    let charger_pump_interval = 60;
+    let charger_pump_interval = 180;
     let stats_interval;
     let batt_interval;
+    let secnotes_interval;
     if cfg!(feature = "slowstatus") {
         // lower the status output rate for braille mode, debugging, etc.
         stats_interval = 30;
         batt_interval = 60;
+        secnotes_interval = 30;
     } else {
         stats_interval = 4;
         batt_interval = 4;
+        secnotes_interval = 4;
     }
     let mut battstats_phase = true;
     let mut needs_redraw = false;
+
+    log::debug!("starting main menu thread");
+    let keys_init;
+    let keys_op;
+    if keys.lock().unwrap().is_initialized().unwrap() {
+        keys_init = 1;
+        keys_op = keys.lock().unwrap().get_update_gateware_op();
+    } else {
+        keys_init = 0;
+        keys_op = keys.lock().unwrap().get_try_init_keys_op();
+    }
+    let sign_op = keys.lock().unwrap().get_try_selfsign_op();
+    xous::create_thread_4(main_menu_thread, keys_init, keys.lock().unwrap().conn() as usize, keys_op as usize, sign_op as usize)
+        .expect("couldn't create menu thread");
 
     info!("|status: starting main loop");
     loop {
@@ -184,14 +263,38 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
             }),
             Some(StatusOpcode::Pump) => {
                 let (is_locked, force_update) = llio.debug_usb(None).unwrap();
-                if (debug_locked != is_locked) || force_update {
-                    debug_locked = is_locked;
-                    security_tv.clear_str();
-                    if debug_locked {
-                        write!(&mut security_tv, " USB secured").unwrap();
-                    } else {
-                        write!(&mut security_tv, " USB unlocked").unwrap();
+                if (debug_locked != is_locked) || force_update
+                || sec_notes.lock().unwrap().len() != last_sec_note_size
+                || (sec_notes.lock().unwrap().len() > 1) && ((stats_phase % secnotes_interval) == 0) {
+                    if debug_locked != is_locked {
+                        if debug_locked {
+                            sec_notes.lock().unwrap().remove(&"secnotes.usb_unlock".to_string());
+                        } else {
+                            sec_notes.lock().unwrap().insert("secnotes.usb_unlock".to_string(), t!("secnote.usb_unlock", xous::LANG).to_string());
+                        }
+                        debug_locked = is_locked;
                     }
+
+                    if sec_notes.lock().unwrap().len() != last_sec_note_size {
+                        last_sec_note_size = sec_notes.lock().unwrap().len();
+                        if last_sec_note_size > 0 {
+                            last_sec_note_index = last_sec_note_size - 1;
+                        }
+                    }
+
+                    security_tv.clear_str();
+                    if last_sec_note_size > 0 {
+                        for (index, v) in sec_notes.lock().unwrap().values().enumerate() {
+                            if index == last_sec_note_index {
+                                write!(&mut security_tv, "{}", v.as_str()).unwrap();
+                                last_sec_note_index = (last_sec_note_index + 1) % last_sec_note_size;
+                                break;
+                            }
+                        }
+                    } else {
+                        write!(&mut security_tv, "{}", t!("secnote.allclear", xous::LANG)).unwrap();
+                    }
+
                     // only post the view if something has actually changed
                     gam.post_textview(&mut security_tv).unwrap();
                     needs_redraw = true;
@@ -201,22 +304,22 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
                 }
 
                 if (stats_phase % charger_pump_interval) == 1 { // stagger periodic tasks
-                    // once a minute confirm that the charger is in the right state.
+                    // confirm that the charger is in the right state.
                     if stats.soc < 95 || stats.remaining_capacity < 1000 { // only request if we aren't fully charged, either by SOC or capacity metrics
                         if (llio.adc_vbus().unwrap() as f64) * 0.005033 > 4.45 { // 4.45V is our threshold for deciding if a cable is present
                             // charging cable is present
                             if !com.is_charging().expect("couldn't check charging state") {
                                 // not charging, but cable is present
-                                log::info!("Charger present, but not currently charging. Automatically requesting charge start.");
+                                log::debug!("Charger present, but not currently charging. Automatically requesting charge start.");
                                 com.request_charging().expect("couldn't send charge request");
                             }
                         }
                     }
                 }
                 if (stats_phase % dt_pump_interval) == 2 {
-                    #[cfg(target_os = "none")]
+                    #[cfg(any(target_os = "none", target_os = "xous"))]
                     rtc.request_datetime().expect("|status: can't request datetime from RTC");
-                    #[cfg(not(target_os = "none"))]
+                    #[cfg(not(any(target_os = "none", target_os = "xous")))]
                     {
                         log::trace!("hosted request of date time - short circuiting server call");
                         use chrono::prelude::*;
@@ -275,7 +378,7 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
                     needs_redraw = false;
                 }
 
-                stats_phase = stats_phase + 1;
+                stats_phase = stats_phase.wrapping_add(1);
             }
             Some(StatusOpcode::DateTime) => {
                 //log::info!("got DateTime update");
@@ -283,7 +386,10 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
                 let dt = buffer.to_original::<rtc::DateTime, _>().unwrap();
                 datetime = Some(dt);
             }
-            None => {log::error!("|status: received unknown Opcode"); break}
+            Some(StatusOpcode::Quit) => {
+                break;
+            }
+            None => {log::error!("|status: received unknown Opcode");}
         }
     }
     log::trace!("status thread exit, destroying servers");
@@ -296,4 +402,135 @@ pub fn status_thread(canvas_gid_0: usize, canvas_gid_1: usize, canvas_gid_2: usi
     xns.unregister_server(status_sid).unwrap();
     xous::destroy_server(status_sid).unwrap();
     log::trace!("status thread quitting");
+    xous::terminate_process(0)
+}
+
+use gam::*;
+// this is the provider for the main menu, it's built into the GAM so we always have at least this
+// root-level menu available
+pub fn main_menu_thread(keys_init: usize, key_conn: usize, key_op: usize, selfsign_op: usize) {
+    let mut menu = Menu::new(gam::api::MAIN_MENU_NAME);
+
+    let xns = xous_names::XousNames::new().unwrap();
+    let susres = susres::Susres::new_without_hook(&xns).unwrap();
+    let com = com::Com::new(&xns).unwrap();
+    let rtc = rtc::Rtc::new(&xns).unwrap();
+
+    let blon_item = MenuItem {
+        name: String::<64>::from_str(t!("mainmenu.backlighton", xous::LANG)),
+        action_conn: com.conn(),
+        action_opcode: com.getop_backlight(),
+        action_payload: MenuPayload::Scalar([191 >> 3, 191 >> 3, 0, 0]),
+        close_on_select: true,
+    };
+    menu.add_item(blon_item);
+
+    let bloff_item = MenuItem {
+        name: String::<64>::from_str(t!("mainmenu.backlightoff", xous::LANG)),
+        action_conn: com.conn(),
+        action_opcode: com.getop_backlight(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: true,
+    };
+    menu.add_item(bloff_item);
+
+    let sleep_item = MenuItem {
+        name: String::<64>::from_str(t!("mainmenu.sleep", xous::LANG)),
+        action_conn: susres.conn(),
+        action_opcode: susres.getop_suspend(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: true,
+    };
+    menu.add_item(sleep_item);
+
+    if keys_init == 0 {
+        let initkeys_item = MenuItem {
+            name: String::<64>::from_str(t!("mainmenu.init_keys", xous::LANG)),
+            action_conn: key_conn as u32,
+            action_opcode: key_op as u32,
+            action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+            close_on_select: true,
+        };
+        menu.add_item(initkeys_item);
+    } else {
+        let provision_item = MenuItem {
+            name: String::<64>::from_str(t!("mainmenu.provision_gateware", xous::LANG)),
+            action_conn: key_conn as u32,
+            action_opcode: key_op as u32, // this op is changed from init to provision when keys_init is 0...
+            action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+            close_on_select: true,
+        };
+        menu.add_item(provision_item);
+
+        let selfsign_item = MenuItem {
+            name: String::<64>::from_str(t!("mainmenu.selfsign", xous::LANG)),
+            action_conn: key_conn as u32,
+            action_opcode: selfsign_op as u32,
+            action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+            close_on_select: true,
+        };
+        menu.add_item(selfsign_item);
+    }
+
+    let setrtc_item = MenuItem {
+        name: String::<64>::from_str(t!("mainmenu.set_rtc", xous::LANG)),
+        action_conn: rtc.conn(),
+        action_opcode: rtc.getop_set_ux(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: true,
+    };
+    menu.add_item(setrtc_item);
+
+    let close_item = MenuItem {
+        name: String::<64>::from_str(t!("mainmenu.closemenu", xous::LANG)),
+        action_conn: menu.gam.conn(),
+        action_opcode: menu.gam.getop_revert_focus(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: false, // don't close because we're already closing
+    };
+    menu.add_item(close_item);
+
+    loop {
+        let msg = xous::receive_message(menu.sid).unwrap();
+        log::trace!("message: {:?}", msg);
+        match FromPrimitive::from_usize(msg.body.id()) {
+            Some(MenuOpcode::Redraw) => {
+                menu.redraw();
+            },
+            Some(MenuOpcode::Rawkeys) => msg_scalar_unpack!(msg, k1, k2, k3, k4, {
+                let keys = [
+                    if let Some(a) = core::char::from_u32(k1 as u32) {
+                        a
+                    } else {
+                        '\u{0000}'
+                    },
+                    if let Some(a) = core::char::from_u32(k2 as u32) {
+                        a
+                    } else {
+                        '\u{0000}'
+                    },
+                    if let Some(a) = core::char::from_u32(k3 as u32) {
+                        a
+                    } else {
+                        '\u{0000}'
+                    },
+                    if let Some(a) = core::char::from_u32(k4 as u32) {
+                        a
+                    } else {
+                        '\u{0000}'
+                    },
+                ];
+                menu.key_event(keys);
+            }),
+            Some(MenuOpcode::Quit) => {
+                break;
+            },
+            None => {
+                log::error!("unknown opcode {:?}", msg.body.id());
+            }
+        }
+    }
+    log::trace!("menu thread exit, destroying servers");
+    // do we want to add a deregister_ux call to the system?
+    xous::destroy_server(menu.sid).unwrap();
 }
