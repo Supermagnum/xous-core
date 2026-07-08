@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-3.0-only
+// SPDX-License-Identifier: Apache-2.0
 //
 //! USB CCID bulk transport: assembles PC_to_RDR frames and streams RDR_to_PC replies.
 //! No APDU or OpenPGP interpretation; an external process supplies raw RDR bytes.
