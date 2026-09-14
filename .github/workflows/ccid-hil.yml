@@ -26,8 +26,13 @@ jobs:
 
       - name: Run CCID HIL suite
         run: |
-          chmod +x tools/ccid_hil/*.sh
-          tools/ccid_hil/run_all.sh
+          if [ -d tools/ccid/ccid_hil ]; then
+            HIL=tools/ccid/ccid_hil
+          else
+            HIL=tools/ccid_hil
+          fi
+          chmod +x "$HIL"/*.sh
+          "$HIL"/run_all.sh
 
       - name: Upload HIL logs
         if: always()
