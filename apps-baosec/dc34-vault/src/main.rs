@@ -22,9 +22,9 @@ mod genemenu;
 mod generator;
 mod idlemenu;
 mod tests;
-mod vendor_commands;
 #[cfg(feature = "tetris")]
 mod tetris;
+mod vendor_commands;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io::{Read, Write};
@@ -57,8 +57,12 @@ use crate::config::{GlobalConfig, read_badgetype_pins};
 pub enum VaultMode {
     Idle,
     IdleDevMode,
-    ShowKey { quantum: u32 },
-    ResponseGene { quantum: u32 },
+    ShowKey {
+        quantum: u32,
+    },
+    ResponseGene {
+        quantum: u32,
+    },
     // state for confirming the current pattern
     ConfirmGene,
     GeneScan,
