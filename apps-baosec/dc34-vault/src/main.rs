@@ -22,11 +22,15 @@ mod genemenu;
 mod generator;
 mod idlemenu;
 mod tests;
+#[cfg(feature = "tetris")]
+mod tetris;
 mod vendor_commands;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "tetris")]
+use std::time::Duration;
 use std::time::Instant;
 
 use dc34_api::*;
@@ -53,8 +57,12 @@ use crate::config::{GlobalConfig, read_badgetype_pins};
 pub enum VaultMode {
     Idle,
     IdleDevMode,
-    ShowKey { quantum: u32 },
-    ResponseGene { quantum: u32 },
+    ShowKey {
+        quantum: u32,
+    },
+    ResponseGene {
+        quantum: u32,
+    },
     // state for confirming the current pattern
     ConfirmGene,
     GeneScan,
@@ -67,6 +75,20 @@ pub enum VaultMode {
     Totp,
     Password,
     TokenHelp,
+    #[cfg(feature = "tetris")]
+    Tetris,
+}
+
+// `is_tetris()` exists so that call sites in the main loop can test for Tetris mode without
+// needing a `#[cfg]` in expression position (which is not stable). With the feature off it is
+// a constant `false`, so the branches that depend on it become dead code and fold away.
+#[cfg(feature = "tetris")]
+impl VaultMode {
+    pub fn is_tetris(&self) -> bool { matches!(self, VaultMode::Tetris) }
+}
+#[cfg(not(feature = "tetris"))]
+impl VaultMode {
+    pub fn is_tetris(&self) -> bool { false }
 }
 
 impl VaultMode {
@@ -87,6 +109,8 @@ impl VaultMode {
             VaultMode::ShowKey { quantum: _ } => true,
             VaultMode::TokenTour => false,
             VaultMode::Tour => false,
+            #[cfg(feature = "tetris")]
+            VaultMode::Tetris => false, // we drive redraws ourselves via TetrisTick
         }
     }
 }
@@ -235,6 +259,27 @@ fn main() -> ! {
     xous::send_message(pump_conn, xous::Message::new_scalar(0, 0, 0, 0, 0))
         .expect("couldn't start the pumper");
 
+    // actual game speed is managed in tetris.rs, screen only redrawn on changes
+    #[cfg(feature = "tetris")]
+    {
+        const TETRIS_TICK_MS: usize = 10;
+        let conn = conn.clone();
+        let mode = mode.clone();
+        std::thread::spawn(move || {
+            let tt = ticktimer_server::Ticktimer::new().unwrap();
+            loop {
+                tt.sleep_ms(TETRIS_TICK_MS).ok();
+                if mode.lock().unwrap().is_tetris() {
+                    xous::send_message(
+                        conn,
+                        xous::Message::new_scalar(VaultOp::TetrisTick.to_usize().unwrap(), 0, 0, 0, 0),
+                    )
+                    .ok();
+                }
+            }
+        });
+    }
+
     // respond to keyboard events - register with the `Gfx` subsystem, so we're getting keypresses
     // filtered by the modals interface
     gfx.register_listener(SERVER_NAME_VAULT2, VaultOp::KeyPress.to_u32().unwrap() as usize);
@@ -366,6 +411,16 @@ fn main() -> ! {
     let mut mutation_param: u8 = 0;
     let mut k_last = '\u{0000}';
     let mut skip_one_key = false;
+    #[cfg(feature = "tetris")]
+    let mut tetris_game: Option<tetris::TetrisGame> = None;
+    #[cfg(feature = "tetris")]
+    let mut last_rotate = Instant::now() - Duration::from_secs(1);
+    #[cfg(feature = "tetris")]
+    const ROTATE_DEBOUNCE_MS: u64 = 50;
+    #[cfg(feature = "tetris")]
+    let mut last_drop = Instant::now() - Duration::from_secs(1);
+    #[cfg(feature = "tetris")]
+    const DROP_DEBOUNCE_MS: u64 = 100;
     loop {
         global_config.lock().unwrap().update_power_state(mode.lock().unwrap().clone());
         let msg = xous::receive_message(sid).unwrap();
@@ -388,7 +443,18 @@ fn main() -> ! {
                     log::info!("{}", mutation_param);
                 }*/
                 if !menu_active {
-                    vault_ui.redraw();
+                    // Tetris paints its own board from the TetrisTick handler; letting the
+                    // periodic pumper redraw run here would paint the item-list UI over it.
+                    if mode.lock().unwrap().is_tetris() {
+                        #[cfg(feature = "tetris")]
+                        {
+                            if let Some(game) = tetris_game.as_ref() {
+                                game.draw(&gfx);
+                            }
+                        }
+                    } else {
+                        vault_ui.redraw();
+                    }
                 }
             }
             Some(VaultOp::ReloadDbAndFullRedraw) => {
@@ -398,14 +464,26 @@ fn main() -> ! {
                 )
                 .ok();
                 vault_ui.refresh_draw_list();
-                vault_ui.redraw();
+                // same as above: don't let a DB/basis-change redraw stomp the Tetris board
+                if !mode.lock().unwrap().is_tetris() {
+                    vault_ui.redraw();
+                }
             }
             Some(VaultOp::MenuDone) => {
                 menu_active = false;
-                // update the TOTP codes, in case there were changes
-                vault_ui.refresh_draw_list();
-                animate.store(mode.lock().unwrap().should_animate(), Ordering::SeqCst);
-                vault_ui.redraw();
+                if mode.lock().unwrap().is_tetris() {
+                    #[cfg(feature = "tetris")]
+                    {
+                        if let Some(game) = tetris_game.as_ref() {
+                            game.draw(&gfx);
+                        }
+                    }
+                } else {
+                    // update the TOTP codes, in case there were changes
+                    vault_ui.refresh_draw_list();
+                    animate.store(mode.lock().unwrap().should_animate(), Ordering::SeqCst);
+                    vault_ui.redraw();
+                }
             }
             Some(VaultOp::SkipKey) => {
                 skip_one_key = true;
@@ -445,10 +523,64 @@ fn main() -> ! {
                         gene_menu_mgr.key_press(k);
                     } else if matches!(mode_now, VaultMode::Idle)
                         || matches!(mode_now, VaultMode::IdleDevMode)
+                        || mode_now.is_tetris()
                     {
+                        // tetris reuses idle_menu_mgr as its pause menu, so input has to be
+                        // routed there while the mode is still Tetris
                         idle_menu_mgr.key_press(k);
                     } else {
                         menu_mgr.key_press(k);
+                    }
+                } else if mode_now.is_tetris() {
+                    #[cfg(feature = "tetris")]
+                    {
+                        if let Some(game) = tetris_game.as_mut() {
+                            match k {
+                                '←' => {
+                                    game.move_left();
+                                    game.draw(&gfx);
+                                }
+                                '→' => {
+                                    game.move_right();
+                                    game.draw(&gfx);
+                                }
+                                '↓' => {
+                                    let now = Instant::now();
+                                    if now.duration_since(last_drop)
+                                        >= Duration::from_millis(DROP_DEBOUNCE_MS)
+                                    {
+                                        last_drop = now;
+                                        game.hard_drop();
+                                        game.draw(&gfx);
+                                    }
+                                }
+                                // Middle front button sends '🔥' on this hardware. Two rotate
+                                // calls from one physical press cancel out, hence the debounce.
+                                '🔥' => {
+                                    let now = Instant::now();
+                                    if now.duration_since(last_rotate)
+                                        >= Duration::from_millis(ROTATE_DEBOUNCE_MS)
+                                    {
+                                        last_rotate = now;
+                                        game.rotate();
+                                        game.draw(&gfx);
+                                    }
+                                }
+                                '↑' => {
+                                    if game.started {
+                                        game.toggle_idle_mode();
+                                        game.draw(&gfx);
+                                    }
+                                }
+                                '∴' => {
+                                    // pause: fall through to idle menu like the normal flow does
+                                    animate.store(false, Ordering::SeqCst);
+                                    idle_menu_mgr.redraw();
+                                    menu_active = true;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 } else {
                     // let the UI get first whack at filtering keys - the '∴' key may be intercepted
@@ -1004,6 +1136,10 @@ fn main() -> ! {
             }
             Some(VaultOp::TokenMode) => {
                 *mode.lock().unwrap() = VaultMode::Password;
+                #[cfg(feature = "tetris")]
+                {
+                    tetris_game = None;
+                }
                 xous::send_message(
                     actions_conn,
                     xous::Message::new_blocking_scalar(ActionOp::ReloadDb.to_usize().unwrap(), 0, 0, 0, 0),
@@ -1024,6 +1160,10 @@ fn main() -> ! {
             }
             Some(VaultOp::BadgeMode) => {
                 *mode.lock().unwrap() = VaultMode::Idle;
+                #[cfg(feature = "tetris")]
+                {
+                    tetris_game = None;
+                }
                 vault_ui.redraw();
             }
             Some(VaultOp::About) => {
@@ -1146,6 +1286,44 @@ fn main() -> ! {
                 *mode.lock().unwrap() = VaultMode::FactoryTest;
                 vault_ui.reset_factory_test();
                 vault_ui.redraw();
+            }
+            #[cfg(feature = "tetris")]
+            Some(VaultOp::MenuTetris) => {
+                *mode.lock().unwrap() = VaultMode::Tetris;
+                let mut game = tetris::TetrisGame::new(&gfx);
+                game.started = true;
+                game.draw(&gfx);
+                tetris_game = Some(game);
+            }
+            #[cfg(feature = "tetris")]
+            Some(VaultOp::TetrisTick) => {
+                // Don't advance gravity or repaint while the pause menu is up, otherwise the
+                // game keeps running underneath it and paints over it.
+                if !menu_active {
+                    if let Some(game) = tetris_game.as_mut() {
+                        let idle_moved = game.idle_tick();
+                        let gravity_advanced = game.gravity_tick();
+                        if idle_moved || gravity_advanced {
+                            game.draw(&gfx);
+                        }
+                        if game.is_over() {
+                            if game.is_idle_mode() {
+                                // keep the demo running instead of kicking out to the menu
+                                let mut fresh_game = tetris::TetrisGame::new(&gfx);
+                                fresh_game.toggle_idle_mode();
+                                fresh_game.draw(&gfx);
+                                tetris_game = Some(fresh_game);
+                            } else {
+                                // return to main list screen
+                                tetris_game = None;
+                                *mode.lock().unwrap() = VaultMode::Idle;
+                                animate.store(false, Ordering::SeqCst);
+                                idle_menu_mgr.redraw();
+                                menu_active = true;
+                            }
+                        }
+                    }
+                }
             }
             _ => {
                 log::error!("Got unknown message: {:?}", msg);

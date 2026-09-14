@@ -32,18 +32,17 @@ ed25519-compact = { version = "1", default-features = false, optional = true }
 rand = { version = "0.8.5" }
 locales = { path = "../../locales" }
 pddb = { path = "../../services/pddb" }
-modals = { path = "../../services/modals", features = [
-    "no-gam",
-] }
+modals = { path = "../../services/modals", features = ["no-gam"] }
 userprefs = { path = "../../libs/userprefs" }
 ux-api = { path = "../../libs/ux-api" }
 bao1x-api = { path = "../../libs/bao1x-api" }
-bao1x-hal = { path = "../../libs/bao1x-hal", features = ["board-baosec", "oem-baosec-lite"] }
+bao1x-hal = { path = "../../libs/bao1x-hal", features = [
+    "board-baosec",
+    "oem-baosec-lite",
+] }
 bao1x-hal-service = { path = "../../services/bao1x-hal-service", optional = true }
 bao1x-emu = { path = "../../services/bao1x-emu", optional = true }
-blitstr2 = { path = "../../libs/blitstr2", features = [
-    "bao1x",
-] }
+blitstr2 = { path = "../../libs/blitstr2", features = ["bao1x"] }
 usb-bao1x = { path = "../../services/usb-bao1x" }
 xous-usb-hid = { git = "https://github.com/betrusted-io/xous-usb-hid.git", branch = "main" }
 keystore = { path = "../../services/keystore" }
@@ -59,7 +58,10 @@ aes = { default-features = false, features = [
 
 # ux formatting
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
-chrono = { version = "0.4.33", default-features = false, features = ["std", "clock"] }
+chrono = { version = "0.4.33", default-features = false, features = [
+    "std",
+    "clock",
+] }
 
 # password generation
 passwords = "3.1.9"
@@ -119,6 +121,9 @@ xous = [
 ] # marks xous-specific code segments deep inside the CTAP crate. Mostly to help evaluate if a patch is even feasible in the future.
 ed25519 = ["ed25519-compact"]
 uber = []
+
+# Tetris minigame. Build with `--features tetris` to include it.
+tetris = []
 
 # when selected, resets the badge state to factory new
 factory-new = []
