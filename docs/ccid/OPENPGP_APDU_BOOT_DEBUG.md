@@ -14,10 +14,10 @@ guide. Verify against current HEAD before treating them as exact.
 
 Related maps:
 
-- [`docs/CCID_PROTOCOL_AND_HIL.md`](CCID_PROTOCOL_AND_HIL.md)
-- [`docs/CCID_USB_ENUMERATION_DEBUG.md`](CCID_USB_ENUMERATION_DEBUG.md)
-- [`docs/code_map.md`](code_map.md)
-- [`docs/CCID_TEST_REPORT.md`](CCID_TEST_REPORT.md)
+- [`CCID_PROTOCOL_AND_HIL.md`](CCID_PROTOCOL_AND_HIL.md)
+- [`CCID_USB_ENUMERATION_DEBUG.md`](CCID_USB_ENUMERATION_DEBUG.md)
+- [`code_map.md`](code_map.md)
+- [`CCID_TEST_REPORT.md`](CCID_TEST_REPORT.md)
 
 ---
 
@@ -167,7 +167,7 @@ comes up.
 
 1. Hold PROG, plug in: boot1 as `1d50:6196`, volume `BAOCHIP`, `/dev/ttyACM0`.
 2. Copy `loader.uf2`, `xous.uf2`, `apps.uf2` from the chosen archive under
-   `images/dabao-ccid/` (or from
+   `local xtask dabao-ccid outputs (not stored in git) ` (or from
    `target/riscv32imac-unknown-xous-elf/release/` after a fresh `xtask` build).
 3. `sync`.
 4. Send `boot` at 1 000 000 8N1 on `/dev/ttyACM0` (PROG alone was not used
@@ -176,14 +176,14 @@ comes up.
 
 Known-good (enumerates): `cargo xtask dabao-ccid --no-verify`
 
-Archive: `images/dabao-ccid/known-good/`
+Archive: ``cargo xtask dabao-ccid --no-verify` (target release UF2s) `
 
 Failing (drops off USB): `cargo xtask dabao-ccid openpgp-apdu --no-verify`
 
-Archive: `images/dabao-ccid/openpgp-apdu/`
+Archive: ``cargo xtask dabao-ccid openpgp-apdu --no-verify` (target release UF2s) `
 
 A later `xtask` run overwrites `target/riscv32imac-unknown-xous-elf/release/`
-but does not touch `images/dabao-ccid/`.
+but does not touch `local xtask dabao-ccid outputs (not stored in git) `.
 
 ---
 
