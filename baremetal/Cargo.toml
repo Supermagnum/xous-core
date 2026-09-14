@@ -66,19 +66,10 @@ bao1x-usb = [
     # "bao1x-hal/verbose-debug",
 ]
 bao1x-buttons = []
-bao1x-trng = [
-    "bao1x-usb",
-    "base64",
-    "xous-bio-bdma/baremetal",
-    "xous-bio-bdma/bao1x",
-]
+bao1x-trng = ["bao1x-usb", "base64"]
 trng-debug = []
 verbose-debug = []
-dabao-selftest = [
-    "xous-bio-bdma/bio-mul",
-    "xous-bio-bdma/baremetal",
-    "xous-bio-bdma/bao1x",
-]
+dabao-selftest = []
 factory-utils = ["ux-api/loader-baosec"]
 ci-security = []
 spim-tests = []

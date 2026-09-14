@@ -23,9 +23,6 @@ ed25519-dalek = { package = "ed25519-dalek-bao1x", path = "../ed25519-dalek-bao1
     "zeroize",
 ], optional = true }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-xous-bio-bdma = { path = "../../libs/xous-bio-bdma", default-features = false, features = [
-    "baremetal",
-] }
 rand_chacha = { version = "0.3.1", default-features = false }
 hex = { version = "0.4.3", default-features = false }
 slh-dsa = { path = "../slh-dsa-bao1x" }

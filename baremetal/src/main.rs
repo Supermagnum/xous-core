@@ -13,14 +13,14 @@ use core::cell::RefCell;
 #[cfg(feature = "bao1x-usb")]
 use core::sync::atomic::Ordering;
 
+#[cfg(feature = "artybio")]
+use bao1x_hal::bio_hw::*;
 #[cfg(feature = "bao1x-usb")]
 use bao1x_hal::{iox::Iox, usb::driver::UsbDeviceState};
 use critical_section::Mutex;
 use platform::*;
 #[allow(unused_imports)]
 use utralib::*;
-#[cfg(feature = "artybio")]
-use xous_bio_bdma::*;
 
 #[allow(unused_imports)]
 use crate::delay;
@@ -220,7 +220,7 @@ pub unsafe extern "C" fn rust_entry() -> ! {
 #[cfg(feature = "artybio")]
 pub fn hello_world() {
     crate::println!("hello world test");
-    let mut bio_ss = BioSharedState::new();
+    let mut bio_ss = BioSharedState::new(100_000_000);
     crate::println!("cfginfo: {:x}", bio_ss.bio.r(utra::bio_bdma::SFR_CFGINFO));
     let simple_test_code = hello_world_code();
     // copy code to reset vector for 0th machine
@@ -271,7 +271,7 @@ bio_code!(hello_world_code, HELLO_START, HELLO_END,
 #[cfg(feature = "artybio")]
 pub fn fifo_basic() -> usize {
     crate::println!("FIFO basic");
-    let mut bio_ss = BioSharedState::new();
+    let mut bio_ss = BioSharedState::new(100_000_000);
     // stop all the machines, so that code can be loaded
     bio_ss.bio.wo(utra::bio_bdma::SFR_CTRL, 0x0);
     bio_ss.load_code(fifo_basic0_code(), 0, BioCore::Core0);

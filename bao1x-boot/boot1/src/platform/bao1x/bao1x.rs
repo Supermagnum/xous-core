@@ -68,7 +68,7 @@ pub fn setup_dabao_se0_pin<T: IoSetup + IoGpio>(iox: &T) -> (IoxPort, u8) {
 }
 
 #[cfg(not(feature = "alt-boot1"))]
-pub fn setup_backup_region() -> u32 {
+pub fn setup_backup_region(fclk_freq: u32) -> u32 {
     let mut bu_mgr = bao1x_hal::buram::BackupManager::new();
     if !bu_mgr.is_backup_valid() {
         // zeroize the hashable backup RAM area
@@ -80,8 +80,9 @@ pub fn setup_backup_region() -> u32 {
         bu_mgr.make_valid();
 
         // setup the BIO, so the reset can also clear its registers and state for a clean BDMA pipeline
-        let mut bio_ss = xous_bio_bdma::BioSharedState::new();
-        bio_ss.init();
+        // .init() is implicit in the bao1x_hal version of the API, so we don't have to call it explicitly
+        let mut bio_ss = bao1x_hal::bio_hw::BioSharedState::new(fclk_freq);
+
         // must disable DMA filtering
         bio_ss.bio.rmwf(utra::bio_bdma::SFR_CONFIG_DISABLE_FILTER_MEM, 1);
         bio_ss.bio.rmwf(utra::bio_bdma::SFR_CONFIG_DISABLE_FILTER_PERI, 1);
@@ -195,8 +196,17 @@ pub fn early_init(mut board_type: bao1x_api::BoardTypeCoding) -> (bao1x_api::Boa
 
     // this has to happen after the IRQs are enabled because if a false security alarm is triggered the
     // system won't reboot properly at the end of the set_backup_region() routine
+    // set the clock
+    let fclk_freq = match board_type {
+        BoardTypeCoding::Baosec => bao1x_api::offsets::baosec::DEFAULT_FCLK_FREQUENCY,
+        #[cfg(feature = "oem-baosec-lite")]
+        BoardTypeCoding::Oem => bao1x_api::offsets::baosec::DEFAULT_FCLK_FREQUENCY,
+        #[cfg(not(feature = "oem-baosec-lite"))]
+        BoardTypeCoding::Oem => SAFE_FCLK_FREQUENCY,
+        BoardTypeCoding::Dabao => bao1x_api::offsets::dabao::DEFAULT_FCLK_FREQUENCY,
+    };
     #[cfg(not(feature = "alt-boot1"))]
-    if setup_backup_region() == 0 {
+    if setup_backup_region(fclk_freq) == 0 {
         crate::println!("backup region is clean!");
     }
 
@@ -465,15 +475,6 @@ pub fn early_init(mut board_type: bao1x_api::BoardTypeCoding) -> (bao1x_api::Boa
         }
     }
 
-    // set the clock
-    let fclk_freq = match board_type {
-        BoardTypeCoding::Baosec => bao1x_api::offsets::baosec::DEFAULT_FCLK_FREQUENCY,
-        #[cfg(feature = "oem-baosec-lite")]
-        BoardTypeCoding::Oem => bao1x_api::offsets::baosec::DEFAULT_FCLK_FREQUENCY,
-        #[cfg(not(feature = "oem-baosec-lite"))]
-        BoardTypeCoding::Oem => SAFE_FCLK_FREQUENCY,
-        BoardTypeCoding::Dabao => bao1x_api::offsets::dabao::DEFAULT_FCLK_FREQUENCY,
-    };
     let perclk = unsafe {
         bao1x_hal::clocks::init_clock_asic(
             fclk_freq,
