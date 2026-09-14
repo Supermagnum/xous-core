@@ -1,5 +1,6 @@
+use bao1x_api::{bio::*, bio_code};
+use bao1x_hal::bio_hw::*;
 use utralib::*;
-use xous_bio_bdma::*;
 
 // pinmask 29 is not mapped out. This is tested by pushing the button to allow boot
 // pinmask 12 & 13 not mapped out. This is tested by tx/rx with the tester
@@ -13,11 +14,11 @@ pub fn dabao_selftest() {
         one_way.inc_coded::<bao1x_api::BootWaitCoding>().unwrap();
     }
 
-    let mut bio_ss = BioSharedState::new();
+    let mut bio_ss = BioSharedState::new(bao1x_api::offsets::dabao::DEFAULT_FCLK_FREQUENCY);
     let iox = bao1x_hal::iox::Iox::new(utra::iox::HW_IOX_BASE as *mut u32);
     iox.set_ports_from_bio_bitmask(DABAO_PINMASK, bao1x_api::bio::IoConfigMode::Overwrite);
     bio_ss.init();
-    bio_ss.load_code(db_pin_test_code(), 0, BioCore::Core0);
+    bio_ss.load_code(db_pin_test_code(), BioCore::Core0);
     bio_ss.bio.wo(utra::bio_bdma::SFR_QDIV0, 0x1_0001);
     bio_ss.set_core_run_states([true, false, false, false]);
 
@@ -25,7 +26,7 @@ pub fn dabao_selftest() {
 
     crate::delay(30);
     const TOTAL_ITERS: usize = 4;
-    for i in 0..TOTAL_ITERS {
+    for _i in 0..TOTAL_ITERS {
         for pin in pin_ordering {
             bio_ss.bio.wo(utra::bio_bdma::SFR_TXF0, 1u32 << pin);
             crate::delay(50);

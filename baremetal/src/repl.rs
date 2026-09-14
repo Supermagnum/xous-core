@@ -887,8 +887,8 @@ impl Repl {
                     unsafe { core::slice::from_raw_parts(slice.as_ptr() as *const u8, len) }
                 }
 
+                use bao1x_hal::bio_hw::*;
                 use bao1x_hal::iox::Iox;
-                use xous_bio_bdma::*;
 
                 let iox = Iox::new(utra::iox::HW_IOX_BASE as *mut u32);
                 let (power_port, power_pin) = bao1x_hal::board::setup_trng_power_pin(&iox);
@@ -897,7 +897,7 @@ impl Repl {
                 // turn on the system
                 iox.set_gpio_pin_value(power_port, power_pin, IoxValue::High);
 
-                let mut bio_ss = BioSharedState::new();
+                let mut bio_ss = BioSharedState::new(bao1x_api::offsets::baosec::DEFAULT_FCLK_FREQUENCY);
                 bio_ss.init();
                 crate::println!("bio_input: {}", bio_mask.value());
                 crate::avtrng::setup(&mut bio_ss, bio_mask.value());
