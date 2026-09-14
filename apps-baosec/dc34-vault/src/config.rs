@@ -273,6 +273,8 @@ impl GlobalConfig {
                 VaultMode::ShowKey { quantum: _ } => (true, LONG_TIMEOUT),
                 VaultMode::TokenTour => (true, MEDIUM_TIMEOUT),
                 VaultMode::Tour => (true, MEDIUM_TIMEOUT),
+                #[cfg(feature = "tetris")]
+                VaultMode::Tetris => (false, 0),
             };
             self.power_manager_config(enable, Some(duration_sec));
         }

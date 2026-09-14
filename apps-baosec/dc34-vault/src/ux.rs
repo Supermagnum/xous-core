@@ -1442,6 +1442,11 @@ impl VaultUi {
                     }
                 }
             } // _ => unimplemented!(),
+            #[cfg(feature = "tetris")]
+            VaultMode::Tetris => {
+                // Intentionally blank: Tetris owns its own render loop in main.rs and never
+                // calls VaultUi::redraw(). This arm only exists for exhaustiveness.
+            }
         }
         self.gfx.flush().ok();
         self.last_mode = (*self.mode.lock().unwrap()).clone();
