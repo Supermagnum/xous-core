@@ -6,7 +6,12 @@ use ux_api::menu::*;
 use crate::ActionOp;
 use crate::VaultOp;
 
-pub fn create_submenu(vault_conn: xous::CID, actions_conn: xous::CID, menu_mgr: xous::SID) -> MenuMatic {
+pub fn create_submenu(
+    vault_conn: xous::CID,
+    actions_conn: xous::CID,
+    menu_mgr: xous::SID,
+    offer_reset: bool,
+) -> MenuMatic {
     let mut menu_items = Vec::<MenuItem>::new();
 
     menu_items.push(MenuItem {
@@ -60,6 +65,13 @@ pub fn create_submenu(vault_conn: xous::CID, actions_conn: xous::CID, menu_mgr: 
         close_on_select: true,
     });
     menu_items.push(MenuItem {
+        name: String::from("Set keymap..."),
+        action_conn: Some(vault_conn),
+        action_opcode: VaultOp::SetKeyMap.to_u32().unwrap(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: true,
+    });
+    menu_items.push(MenuItem {
         name: String::from("Help"),
         action_conn: Some(vault_conn),
         action_opcode: VaultOp::MenuTokenHelp.to_u32().unwrap(),
@@ -73,6 +85,22 @@ pub fn create_submenu(vault_conn: xous::CID, actions_conn: xous::CID, menu_mgr: 
         action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
         close_on_select: true,
     });
+    menu_items.push(MenuItem {
+        name: String::from("USB serial..."),
+        action_conn: Some(vault_conn),
+        action_opcode: VaultOp::UsbSerial.to_u32().unwrap(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: true,
+    });
+    if offer_reset {
+        menu_items.push(MenuItem {
+            name: String::from("Regen FIDO..."),
+            action_conn: Some(vault_conn),
+            action_opcode: VaultOp::ResetToken.to_u32().unwrap(),
+            action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+            close_on_select: true,
+        });
+    }
     menu_items.push(MenuItem {
         name: String::from(t!("vault.menu_close", locales::LANG)),
         action_conn: Some(actions_conn),

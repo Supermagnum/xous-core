@@ -537,6 +537,7 @@ pub struct VaultUi {
     edge: bool,
     last_mode: VaultMode,
     pub bio_loaded: bool,
+    keystore: keystore::Keystore,
 }
 
 impl VaultUi {
@@ -601,6 +602,7 @@ impl VaultUi {
             edge: false,
             last_mode: VaultMode::FactoryTest,
             bio_loaded: false,
+            keystore: keystore::Keystore::new(xns),
         }
     }
 
@@ -1082,7 +1084,7 @@ impl VaultUi {
                 // ---- draw the top "detail info" about the selected password ----
                 let mut insert_at = 0;
                 if let Some(entry) = self.get_selected_item() {
-                    log::debug!("rendering entry {:?}", entry);
+                    // log::debug!("rendering entry {:?}", entry);
                     // draw more data about the selected item
                     let mut box_text = TextView::new(
                         Gid::dummy(),
@@ -1440,6 +1442,11 @@ impl VaultUi {
                     }
                 }
             } // _ => unimplemented!(),
+            #[cfg(feature = "tetris")]
+            VaultMode::Tetris => {
+                // Intentionally blank: Tetris owns its own render loop in main.rs and never
+                // calls VaultUi::redraw(). This arm only exists for exhaustiveness.
+            }
         }
         self.gfx.flush().ok();
         self.last_mode = (*self.mode.lock().unwrap()).clone();
@@ -1564,9 +1571,7 @@ impl VaultUi {
                 }
                 if self.about_state.is_diagnostics() {
                     if k == '↑' {
-                        let xns = xous_names::XousNames::new().unwrap();
-                        let keystore = keystore::Keystore::new(&xns);
-                        keystore.bootwait(Some(false)).unwrap();
+                        self.keystore.bootwait(Some(false)).unwrap();
                         log::info!("Bootwait secret disable activated");
                     }
                 }

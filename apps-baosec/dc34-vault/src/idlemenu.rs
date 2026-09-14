@@ -28,6 +28,26 @@ pub fn create_submenu(vault_conn: xous::CID, actions_conn: xous::CID, menu_mgr: 
         action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
         close_on_select: true,
     });
+    #[cfg(feature = "tetris")]
+    menu_items.push(MenuItem {
+        name: String::from("Tetris"),
+        action_conn: Some(vault_conn),
+        action_opcode: VaultOp::MenuTetris.to_u32().unwrap(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: true,
+    });
+    // This menu doubles as the Tetris pause menu (opened via '∴' while playing), and without
+    // this there is no direct way back to the badge screen short of detouring through Token
+    // Mode -> Badge Mode. Gated with the game itself, since that is the only thing that
+    // motivates it.
+    #[cfg(feature = "tetris")]
+    menu_items.push(MenuItem {
+        name: String::from("Exit to Badge"),
+        action_conn: Some(vault_conn),
+        action_opcode: VaultOp::BadgeMode.to_u32().unwrap(),
+        action_payload: MenuPayload::Scalar([0, 0, 0, 0]),
+        close_on_select: true,
+    });
     menu_items.push(MenuItem {
         name: String::from("Close Menu"),
         action_conn: Some(actions_conn),

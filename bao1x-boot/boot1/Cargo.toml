@@ -23,9 +23,6 @@ ed25519-dalek = { package = "ed25519-dalek-bao1x", path = "../ed25519-dalek-bao1
     "zeroize",
 ], optional = true }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
-xous-bio-bdma = { path = "../../libs/xous-bio-bdma", default-features = false, features = [
-    "baremetal",
-] }
 rand_chacha = { version = "0.3.1", default-features = false }
 hex = { version = "0.4.3", default-features = false }
 slh-dsa = { path = "../slh-dsa-bao1x" }
@@ -44,7 +41,7 @@ bao1x = [
     # needed for the boot logo
     "ux-api/loader-baosec",
 ]
-unsafe-debug = []
+unsafe-debug = ["print-ifr"]
 verbose-debug = ["bao1x-hal/debug-print-uart", "bao1x-hal/verbose-debug"]
 print-ifr = []
 
@@ -57,7 +54,15 @@ pq-check = []
 oem = []
 oem-baosec-lite = ["oem", "bao1x-hal/oem-baosec-lite"]
 
+# invokes the third party key provisioning path
+thirdparty = []
+
 qe-debug = ["verbose-debug", "bao1x-hal/debug-print-duart"]
+
+# various pocs for security issues
+pocs = []
+# check and fix IFR values - requires an unsafe setting from bao1x-hal
+fix-ifr = ["bao1x-hal/redteam"]
 
 verilator-only = []
 default = ["oem-baosec-lite"]

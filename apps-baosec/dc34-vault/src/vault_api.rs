@@ -42,6 +42,8 @@ pub(crate) enum VaultOp {
     MenuTokenHelp,
     MenuUsernames,
     MenuFilter,
+    UsbSerial,
+    SetKeyMap,
 
     /// Tour menu
     TourContinue,
@@ -65,6 +67,13 @@ pub(crate) enum VaultOp {
     HandleQr,
     AbortQr,
 
+    // Note: these sit before the explicitly-numbered ImageLoad = 1024, so gating them out
+    // leaves every other opcode's discriminant unchanged.
+    #[cfg(feature = "tetris")]
+    MenuTetris,
+    #[cfg(feature = "tetris")]
+    TetrisTick,
+
     // monkey patch for last-minute custom image feature - discriminant is hard-coded into dc34-console
     ImageLoad = 1024,
     // monkey patch to force jig mode, for re-tested units in the factory
@@ -73,6 +82,8 @@ pub(crate) enum VaultOp {
     SkipKey = 1026,
     // monkey patch to indicate if BIO hacks are active
     BioActive = 1027,
+    // work-around to offer a token reset due to earlier issues with TRNG
+    ResetToken = 1028,
 }
 
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]

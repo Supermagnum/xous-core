@@ -2,6 +2,7 @@ mod ux;
 use aes::{Aes256, cipher::BlockSizeUser};
 use aes_gcm_siv::aead::{Aead, Payload};
 use aes_gcm_siv::{Nonce, Tag};
+use bao1x_api::keyboard::KeyMap;
 use ux::*;
 mod itemcache;
 use itemcache::*;
@@ -21,11 +22,15 @@ mod genemenu;
 mod generator;
 mod idlemenu;
 mod tests;
+#[cfg(feature = "tetris")]
+mod tetris;
 mod vendor_commands;
 
 use core::sync::atomic::{AtomicBool, Ordering};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "tetris")]
+use std::time::Duration;
 use std::time::Instant;
 
 use dc34_api::*;
@@ -37,10 +42,6 @@ use xous_ipc::Buffer;
 
 use crate::actions::ActionOp;
 use crate::config::{GlobalConfig, read_badgetype_pins};
-
-/*
-  k0 hash check correct value: dca9ea49
-*/
 
 // Reproducible bootloader:
 // git clone https://github.com/sbellem/baobit.git
@@ -56,8 +57,12 @@ use crate::config::{GlobalConfig, read_badgetype_pins};
 pub enum VaultMode {
     Idle,
     IdleDevMode,
-    ShowKey { quantum: u32 },
-    ResponseGene { quantum: u32 },
+    ShowKey {
+        quantum: u32,
+    },
+    ResponseGene {
+        quantum: u32,
+    },
     // state for confirming the current pattern
     ConfirmGene,
     GeneScan,
@@ -70,6 +75,20 @@ pub enum VaultMode {
     Totp,
     Password,
     TokenHelp,
+    #[cfg(feature = "tetris")]
+    Tetris,
+}
+
+// `is_tetris()` exists so that call sites in the main loop can test for Tetris mode without
+// needing a `#[cfg]` in expression position (which is not stable). With the feature off it is
+// a constant `false`, so the branches that depend on it become dead code and fold away.
+#[cfg(feature = "tetris")]
+impl VaultMode {
+    pub fn is_tetris(&self) -> bool { matches!(self, VaultMode::Tetris) }
+}
+#[cfg(not(feature = "tetris"))]
+impl VaultMode {
+    pub fn is_tetris(&self) -> bool { false }
 }
 
 impl VaultMode {
@@ -90,6 +109,8 @@ impl VaultMode {
             VaultMode::ShowKey { quantum: _ } => true,
             VaultMode::TokenTour => false,
             VaultMode::Tour => false,
+            #[cfg(feature = "tetris")]
+            VaultMode::Tetris => false, // we drive redraws ourselves via TetrisTick
         }
     }
 }
@@ -120,6 +141,7 @@ fn main() -> ! {
     // Protects access to the openSK PDDB entries from simultaneous readout on the UX while OpenSK is updating
     let opensk_mutex = Arc::new(Mutex::new(0));
     let allow_host = Arc::new(AtomicBool::new(false));
+    let keystore = keystore::Keystore::new(&xns);
 
     // spawn the actions server. This is responsible for grooming the UX elements. It
     // has to be in its own thread because it uses blocking modal calls that would cause
@@ -141,7 +163,6 @@ fn main() -> ! {
 
     log::info!("menus");
     let menu_sid = xous::create_server().unwrap();
-    let menu_mgr = submenu::create_submenu(conn, actions_conn, menu_sid);
     let tour_menu_sid = xous::create_server().unwrap();
     let tour_menu_mgr = tourmenu::create_submenu(conn, actions_conn, tour_menu_sid);
     let gene_menu_sid = xous::create_server().unwrap();
@@ -186,13 +207,22 @@ fn main() -> ! {
 
     log::info!("Read config...");
     // this must init after PDDB is mounted
-    let (global_config, init_mode) = GlobalConfig::init();
+    let (global_config, init_mode) = GlobalConfig::init(&keystore);
     let global_config = Arc::new(Mutex::new(global_config));
     *mode.lock().unwrap() = init_mode;
     vault_ui.set_global_config(global_config.clone());
 
     log::info!("Fido2 service");
-    fido2::fido2_handler(conn, allow_host.clone(), opensk_mutex.clone(), animate.clone());
+    let is_fido_unused = Arc::new(AtomicBool::new(false));
+    let is_unused_set = Arc::new(AtomicBool::new(false));
+    fido2::fido2_handler(
+        conn,
+        allow_host.clone(),
+        opensk_mutex.clone(),
+        animate.clone(),
+        is_fido_unused.clone(),
+        is_unused_set.clone(),
+    );
 
     // overrides for testing
     #[cfg(feature = "production")]
@@ -229,6 +259,27 @@ fn main() -> ! {
     xous::send_message(pump_conn, xous::Message::new_scalar(0, 0, 0, 0, 0))
         .expect("couldn't start the pumper");
 
+    // actual game speed is managed in tetris.rs, screen only redrawn on changes
+    #[cfg(feature = "tetris")]
+    {
+        const TETRIS_TICK_MS: usize = 10;
+        let conn = conn.clone();
+        let mode = mode.clone();
+        std::thread::spawn(move || {
+            let tt = ticktimer_server::Ticktimer::new().unwrap();
+            loop {
+                tt.sleep_ms(TETRIS_TICK_MS).ok();
+                if mode.lock().unwrap().is_tetris() {
+                    xous::send_message(
+                        conn,
+                        xous::Message::new_scalar(VaultOp::TetrisTick.to_usize().unwrap(), 0, 0, 0, 0),
+                    )
+                    .ok();
+                }
+            }
+        });
+    }
+
     // respond to keyboard events - register with the `Gfx` subsystem, so we're getting keypresses
     // filtered by the modals interface
     gfx.register_listener(SERVER_NAME_VAULT2, VaultOp::KeyPress.to_u32().unwrap() as usize);
@@ -250,7 +301,6 @@ fn main() -> ! {
     {
         // check/trigger swap encryption before starting the main loop
         let xns = xous_names::XousNames::new().unwrap();
-        let keystore = keystore::Keystore::new(&xns);
         const THROW_AWAY_SERVER: &'static str = "_use once server_";
         const THROW_AWAY_OP: usize = 42;
         // idle forever, maybe turn this into a full blocking server that just parks and ends
@@ -297,15 +347,84 @@ fn main() -> ! {
         }
     }
 
+    let usb = usb_bao1x::UsbHid::new();
+    // setup the default keymap
+    match pddb.get(DC34_DICT, DC34_KEYMAP, None, false, false, None, None::<fn()>) {
+        Ok(mut entry) => {
+            let mut data = Vec::<u8>::new();
+            match entry.read_to_end(&mut data) {
+                Ok(4) => {
+                    let kbd_code = usize::from_le_bytes(data.try_into().unwrap());
+                    let kbd_decoded: KeyMap = kbd_code.into();
+                    log::info!("Setting host keyboard mapping to {:?}", kbd_decoded);
+                    usb.set_key_map(kbd_decoded);
+                }
+                _ => usb.set_key_map(KeyMap::Qwerty),
+            }
+        }
+        _ => {
+            // initialize the key
+            let mut kbd_key = pddb
+                .get(DC34_DICT, DC34_KEYMAP, None, true, true, None, None::<fn()>)
+                .expect("couldn't create PDDB key");
+            // initialize to Dvorak, so that users who created passwords using the stock conference firmware
+            // don't have a surprising experience that their passwords stopped working on the firmware update
+            let kbd_code: usize = KeyMap::Dvorak.into();
+            kbd_key.write(&kbd_code.to_le_bytes()).ok();
+        }
+    }
+
+    if !xns.trusted_init_done().expect("couldn't query trusted init state") {
+        panic!(
+            "Trusted init state is inconsistent; check that connection count required for keystore is consistent with reality."
+        );
+    }
+
+    // This block of code fixes a bug that happened in the shipping DC34 badges. An issue with TRNG seeding
+    // was identified that could reduce the original entropy pool to as little as 64 bits. This has since
+    // been fixed. The primary impact is the CRED_RANDOM_SECRET *might* have less entropy than intended -
+    // emphasis on might because the TRNG reseeds itself frequently. However, the most conservative
+    // assumption is that no reseed operation was hit and thus this one secret has less entropy than
+    // desired. This code detects if the device was ever used as a FIDO token (if it was used, then, a
+    // certain set of *other* secrets are on-demand generated). If it hasn't been used, the
+    // CRED_RANDOM_SECRET is regenerated from scratch, fixing the potential issue. If it has been used, a
+    // menu option offering users a one-time ability to regenerate their FIDO token is offered.
+    while !is_unused_set.load(Ordering::SeqCst) {
+        xous::yield_slice();
+    }
+    log::info!("Is FIDO feature unused: {:?}", is_fido_unused.load(Ordering::SeqCst));
+    let offer_reset = keystore.get_owc(FIDO_REINIT).unwrap() == 0;
+    // if the system hasn't been used, just regenerate all the keys without asking.
+    if offer_reset && is_fido_unused.load(Ordering::SeqCst) {
+        // safety: the constant is defined and in-range
+        unsafe { keystore.inc_owc(FIDO_REINIT).unwrap() };
+        pddb.delete_dict("opensk", None).ok();
+        pddb.delete_dict("fido.u2fapps", None).ok();
+        pddb.sync().unwrap();
+        let susres = susres::Susres::new_without_hook(&xns).unwrap();
+        susres.reboot(true).unwrap();
+    }
+    let menu_mgr = submenu::create_submenu(conn, actions_conn, menu_sid, offer_reset);
+
     let mut menu_active = false;
     let mut jig_ready_seen = false;
     let mut mutation_param: u8 = 0;
     let mut k_last = '\u{0000}';
     let mut skip_one_key = false;
+    #[cfg(feature = "tetris")]
+    let mut tetris_game: Option<tetris::TetrisGame> = None;
+    #[cfg(feature = "tetris")]
+    let mut last_rotate = Instant::now() - Duration::from_secs(1);
+    #[cfg(feature = "tetris")]
+    const ROTATE_DEBOUNCE_MS: u64 = 50;
+    #[cfg(feature = "tetris")]
+    let mut last_drop = Instant::now() - Duration::from_secs(1);
+    #[cfg(feature = "tetris")]
+    const DROP_DEBOUNCE_MS: u64 = 100;
     loop {
         global_config.lock().unwrap().update_power_state(mode.lock().unwrap().clone());
         let msg = xous::receive_message(sid).unwrap();
-        log::trace!("Got message: {:?}", msg.body.id());
+        // log::trace!("Got message: {:?}", msg.body.id());
         match FromPrimitive::from_usize(msg.body.id()) {
             Some(VaultOp::Redraw) => {
                 if !boot_sent {
@@ -324,7 +443,18 @@ fn main() -> ! {
                     log::info!("{}", mutation_param);
                 }*/
                 if !menu_active {
-                    vault_ui.redraw();
+                    // Tetris paints its own board from the TetrisTick handler; letting the
+                    // periodic pumper redraw run here would paint the item-list UI over it.
+                    if mode.lock().unwrap().is_tetris() {
+                        #[cfg(feature = "tetris")]
+                        {
+                            if let Some(game) = tetris_game.as_ref() {
+                                game.draw(&gfx);
+                            }
+                        }
+                    } else {
+                        vault_ui.redraw();
+                    }
                 }
             }
             Some(VaultOp::ReloadDbAndFullRedraw) => {
@@ -334,14 +464,26 @@ fn main() -> ! {
                 )
                 .ok();
                 vault_ui.refresh_draw_list();
-                vault_ui.redraw();
+                // same as above: don't let a DB/basis-change redraw stomp the Tetris board
+                if !mode.lock().unwrap().is_tetris() {
+                    vault_ui.redraw();
+                }
             }
             Some(VaultOp::MenuDone) => {
                 menu_active = false;
-                // update the TOTP codes, in case there were changes
-                vault_ui.refresh_draw_list();
-                animate.store(mode.lock().unwrap().should_animate(), Ordering::SeqCst);
-                vault_ui.redraw();
+                if mode.lock().unwrap().is_tetris() {
+                    #[cfg(feature = "tetris")]
+                    {
+                        if let Some(game) = tetris_game.as_ref() {
+                            game.draw(&gfx);
+                        }
+                    }
+                } else {
+                    // update the TOTP codes, in case there were changes
+                    vault_ui.refresh_draw_list();
+                    animate.store(mode.lock().unwrap().should_animate(), Ordering::SeqCst);
+                    vault_ui.redraw();
+                }
             }
             Some(VaultOp::SkipKey) => {
                 skip_one_key = true;
@@ -364,7 +506,7 @@ fn main() -> ! {
                     k_last = k;
                 }
                 global_config.lock().unwrap().set_mutation_rate(MutationRate::from_param(mutation_param));
-                log::debug!("key {:x}", k1);
+                // log::debug!("key {:x}", k1);
 
                 // on the very first `~` received, this will transition a factory test state. In normal
                 // operation this has no effect on the UI. But in factory test state this is an easy way to
@@ -381,10 +523,64 @@ fn main() -> ! {
                         gene_menu_mgr.key_press(k);
                     } else if matches!(mode_now, VaultMode::Idle)
                         || matches!(mode_now, VaultMode::IdleDevMode)
+                        || mode_now.is_tetris()
                     {
+                        // tetris reuses idle_menu_mgr as its pause menu, so input has to be
+                        // routed there while the mode is still Tetris
                         idle_menu_mgr.key_press(k);
                     } else {
                         menu_mgr.key_press(k);
+                    }
+                } else if mode_now.is_tetris() {
+                    #[cfg(feature = "tetris")]
+                    {
+                        if let Some(game) = tetris_game.as_mut() {
+                            match k {
+                                '←' => {
+                                    game.move_left();
+                                    game.draw(&gfx);
+                                }
+                                '→' => {
+                                    game.move_right();
+                                    game.draw(&gfx);
+                                }
+                                '↓' => {
+                                    let now = Instant::now();
+                                    if now.duration_since(last_drop)
+                                        >= Duration::from_millis(DROP_DEBOUNCE_MS)
+                                    {
+                                        last_drop = now;
+                                        game.hard_drop();
+                                        game.draw(&gfx);
+                                    }
+                                }
+                                // Middle front button sends '🔥' on this hardware. Two rotate
+                                // calls from one physical press cancel out, hence the debounce.
+                                '🔥' => {
+                                    let now = Instant::now();
+                                    if now.duration_since(last_rotate)
+                                        >= Duration::from_millis(ROTATE_DEBOUNCE_MS)
+                                    {
+                                        last_rotate = now;
+                                        game.rotate();
+                                        game.draw(&gfx);
+                                    }
+                                }
+                                '↑' => {
+                                    if game.started {
+                                        game.toggle_idle_mode();
+                                        game.draw(&gfx);
+                                    }
+                                }
+                                '∴' => {
+                                    // pause: fall through to idle menu like the normal flow does
+                                    animate.store(false, Ordering::SeqCst);
+                                    idle_menu_mgr.redraw();
+                                    menu_active = true;
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 } else {
                     // let the UI get first whack at filtering keys - the '∴' key may be intercepted
@@ -611,7 +807,7 @@ fn main() -> ! {
                 // top-level context. This avoids us having to share every object into the ActionManager.
                 let buffer = unsafe { Buffer::from_memory_message(msg.body.memory_message().unwrap()) };
                 let s: IpcString = buffer.to_original::<IpcString, _>().unwrap();
-                log::info!("mode: {:?}, s: {}", mode_now, s.s);
+                // log::info!("mode: {:?}, s: {}", mode_now, s.s);
                 skip_one_key = false;
 
                 match mode_now {
@@ -620,7 +816,7 @@ fn main() -> ! {
                     | VaultMode::ShowKey { quantum: _ } => {
                         match base45::decode(&s.s.as_bytes()) {
                             Ok(data) => {
-                                log::debug!("b45dec: {:x?}", data);
+                                // log::debug!("b45dec: {:x?}", data);
                                 if data.len() < DC34_HEADER.len() {
                                     log::error!("protocol error: QR data too short");
                                     *mode.lock().unwrap() = VaultMode::Idle;
@@ -649,9 +845,9 @@ fn main() -> ! {
                                     let mut response = Vec::new();
                                     response.extend_from_slice(&ct_nonce);
 
-                                    log::debug!("raw {} bytes", response.len());
+                                    // log::debug!("raw {} bytes", response.len());
                                     let encoded = base45::encode(&response);
-                                    log::debug!("encoding {} bytes", encoded.as_bytes().len());
+                                    // log::debug!("encoding {} bytes", encoded.as_bytes().len());
                                     let code = QrCode::with_error_correction_level(
                                         encoded.as_bytes(),
                                         qrcode::EcLevel::M,
@@ -693,14 +889,14 @@ fn main() -> ! {
                                             .store(mode.lock().unwrap().should_animate(), Ordering::SeqCst);
                                         continue;
                                     };
-                                    log::debug!("nonce1: {:x?}", nonce1);
+                                    // log::debug!("nonce1: {:x?}", nonce1);
                                     // extract & save their nonce
                                     let aead = global_config.lock().unwrap().cipher();
                                     let payload = Payload { msg: &data, aad: &[] };
-                                    log::debug!("payload: {:x?} {:x?}", payload.msg, payload.aad);
+                                    // log::debug!("payload: {:x?} {:x?}", payload.msg, payload.aad);
                                     match aead.decrypt(&nonce1, payload) {
                                         Ok(msg) => {
-                                            log::debug!("decrypted {:x?}", msg);
+                                            // log::debug!("decrypted {:x?}", msg);
                                             if let Some(mut sperm) =
                                                 Haploid::deserialize(&msg[..size_of::<Haploid>()])
                                             {
@@ -906,7 +1102,6 @@ fn main() -> ! {
                     .ok();
                     vault_ui.refresh_draw_list();
                 }
-                log::info!("tour_later redraw");
                 vault_ui.redraw();
             }
             Some(VaultOp::TourNever) => {
@@ -941,6 +1136,10 @@ fn main() -> ! {
             }
             Some(VaultOp::TokenMode) => {
                 *mode.lock().unwrap() = VaultMode::Password;
+                #[cfg(feature = "tetris")]
+                {
+                    tetris_game = None;
+                }
                 xous::send_message(
                     actions_conn,
                     xous::Message::new_blocking_scalar(ActionOp::ReloadDb.to_usize().unwrap(), 0, 0, 0, 0),
@@ -961,6 +1160,10 @@ fn main() -> ! {
             }
             Some(VaultOp::BadgeMode) => {
                 *mode.lock().unwrap() = VaultMode::Idle;
+                #[cfg(feature = "tetris")]
+                {
+                    tetris_game = None;
+                }
                 vault_ui.redraw();
             }
             Some(VaultOp::About) => {
@@ -1017,10 +1220,110 @@ fn main() -> ! {
                     global_config.lock().unwrap().render_gene();
                 }
             }),
+            Some(VaultOp::UsbSerial) => {
+                // handle USB serial hooking/unhooking
+                modals.add_list_item("Yes").unwrap();
+                modals.add_list_item("No").unwrap();
+                modals.get_radiobutton("Enable debug console?").unwrap();
+                if match modals.get_radio_index() {
+                    Ok(button) => button == 0,
+                    _ => false,
+                } {
+                    usb.serial_console_input_injection();
+                } else {
+                    usb.serial_clear_input_hooks();
+                }
+            }
+            Some(VaultOp::SetKeyMap) => {
+                let mut kbd_key = pddb
+                    .get(DC34_DICT, DC34_KEYMAP, None, true, true, None, None::<fn()>)
+                    .expect("couldn't get PDDB key");
+
+                modals.add_list_item("QWERTY").unwrap();
+                modals.add_list_item("Dvorak").unwrap();
+                modals.get_radiobutton("Select host keyboard mapping").unwrap();
+                let map_code: usize = match modals.get_radio_index() {
+                    Ok(code) => {
+                        if code == 1 {
+                            KeyMap::Dvorak.into()
+                        } else {
+                            KeyMap::Qwerty.into()
+                        }
+                    }
+                    _ => KeyMap::Qwerty.into(),
+                };
+                kbd_key.write(&map_code.to_le_bytes()).ok();
+                usb.set_key_map(map_code.into());
+            }
+            Some(VaultOp::ResetToken) => {
+                modals.add_list_item("No").unwrap();
+                modals.add_list_item("Yes").unwrap();
+                modals
+                    .get_radiobutton("Regenerate FIDO token? DANGER: permanent loss of existing token data.")
+                    .unwrap();
+                match modals.get_radio_index() {
+                    Ok(code) => {
+                        // the offer_reset check is included here to catch any cases where ResetToken was
+                        // accidentally triggered due to other code bugs. Basically,
+                        // once the FIDO_REINIT has been incremented, it
+                        // should be impossible to enter the path that wipes the FIDO store.
+                        if code == 1 && offer_reset {
+                            // safety: the constant is defined and in-range
+                            unsafe { keystore.inc_owc(FIDO_REINIT).unwrap() };
+                            pddb.delete_dict("opensk", None).ok();
+                            pddb.delete_dict("fido.u2fapps", None).ok();
+                            pddb.sync().unwrap();
+                            let susres = susres::Susres::new_without_hook(&xns).unwrap();
+                            susres.reboot(true).unwrap();
+                        }
+                    }
+                    Err(_) => {
+                        log::error!("Error in user query, cowardly not doing anything");
+                    }
+                };
+            }
             Some(VaultOp::Jig) => {
                 *mode.lock().unwrap() = VaultMode::FactoryTest;
                 vault_ui.reset_factory_test();
                 vault_ui.redraw();
+            }
+            #[cfg(feature = "tetris")]
+            Some(VaultOp::MenuTetris) => {
+                *mode.lock().unwrap() = VaultMode::Tetris;
+                let mut game = tetris::TetrisGame::new(&gfx);
+                game.started = true;
+                game.draw(&gfx);
+                tetris_game = Some(game);
+            }
+            #[cfg(feature = "tetris")]
+            Some(VaultOp::TetrisTick) => {
+                // Don't advance gravity or repaint while the pause menu is up, otherwise the
+                // game keeps running underneath it and paints over it.
+                if !menu_active {
+                    if let Some(game) = tetris_game.as_mut() {
+                        let idle_moved = game.idle_tick();
+                        let gravity_advanced = game.gravity_tick();
+                        if idle_moved || gravity_advanced {
+                            game.draw(&gfx);
+                        }
+                        if game.is_over() {
+                            if game.is_idle_mode() {
+                                // keep the demo running instead of kicking out to the menu
+                                let mut fresh_game = tetris::TetrisGame::new(&gfx);
+                                fresh_game.toggle_idle_mode();
+                                fresh_game.draw(&gfx);
+                                tetris_game = Some(fresh_game);
+                            } else {
+                                // return to main list screen
+                                tetris_game = None;
+                                *mode.lock().unwrap() = VaultMode::Idle;
+                                animate.store(false, Ordering::SeqCst);
+                                idle_menu_mgr.redraw();
+                                menu_active = true;
+                            }
+                        }
+                    }
+                }
             }
             _ => {
                 log::error!("Got unknown message: {:?}", msg);

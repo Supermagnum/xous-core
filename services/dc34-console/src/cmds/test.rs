@@ -9,6 +9,7 @@ use crate::{CommonEnv, ShellCmdApi};
 #[derive(Debug)]
 pub struct Test {
     pwr_mgr: xous::CID,
+    keystore: keystore::Keystore,
     #[cfg(feature = "qa-test")]
     mutation_rate: u8,
 }
@@ -17,10 +18,34 @@ impl Test {
         let xns = xous_names::XousNames::new().unwrap();
         Self {
             pwr_mgr: xns.request_connection_blocking(POWER_MANAGER_SERVER).unwrap(),
+            keystore: keystore::Keystore::new(&xns),
             #[cfg(feature = "qa-test")]
             mutation_rate: 1,
         }
     }
+}
+
+#[cfg(feature = "pddb-test")]
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    io::{Read, Write as FsWrite},
+};
+
+#[cfg(feature = "pddb-test")]
+use rand::Rng;
+#[cfg(feature = "pddb-test")]
+const TEST_BIO: &str = "test.code";
+#[cfg(feature = "pddb-test")]
+const TEST_BIO_PINS: &str = "test.pins";
+#[cfg(feature = "pddb-test")]
+const TEST_BIO_CLK: &str = "test.clk";
+
+#[cfg(feature = "pddb-test")]
+fn checksum(data: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl<'a> ShellCmdApi<'a> for Test {
@@ -41,15 +66,14 @@ impl<'a> ShellCmdApi<'a> for Test {
 
         match cmd.as_str() {
             "bootwait" => {
-                let keystore = keystore::Keystore::new(&_env.xns);
                 if args.len() != 1 {
                     write!(ret, "bootwait [check | enable | disable]").ok();
                     return Ok(Some(ret));
                 }
                 if args[0] == "check" {
-                    write!(ret, "bootwait is {:?}", keystore.bootwait(None).unwrap()).ok();
+                    write!(ret, "bootwait is {:?}", self.keystore.bootwait(None).unwrap()).ok();
                 } else if args[0] == "enable" {
-                    keystore.bootwait(Some(true)).unwrap();
+                    self.keystore.bootwait(Some(true)).unwrap();
                     write!(ret, "bootwait enabled").ok();
                     log::info!(
                         "{}BOOTWAIT.ENABLED,{}",
@@ -57,7 +81,7 @@ impl<'a> ShellCmdApi<'a> for Test {
                         bao1x_hal::board::BOOKEND_END
                     );
                 } else if args[0] == "disable" {
-                    keystore.bootwait(Some(false)).unwrap();
+                    self.keystore.bootwait(Some(false)).unwrap();
                     write!(ret, "bootwait disabled").ok();
                 } else {
                     write!(ret, "bootwait [check | enable | disable]").ok();
@@ -674,12 +698,23 @@ impl<'a> ShellCmdApi<'a> for Test {
             }
             #[cfg(feature = "owc-test")]
             "owc" => {
-                let keystore = keystore::Keystore::new(&_env.xns);
-                log::info!("{:?}", keystore.get_owc_decoded::<bao1x_api::offsets::common::BoardTypeCoding>());
+                log::info!(
+                    "{:?}",
+                    self.keystore.get_owc_decoded::<bao1x_api::offsets::common::BoardTypeCoding>()
+                );
 
-                log::info!("{:?}", keystore.get_owc_decoded::<bao1x_api::offsets::common::BootWaitCoding>());
-                log::info!("{:?}", keystore.inc_owc_coded::<bao1x_api::offsets::common::BootWaitCoding>());
-                log::info!("{:?}", keystore.get_owc_decoded::<bao1x_api::offsets::common::BootWaitCoding>());
+                log::info!(
+                    "{:?}",
+                    self.keystore.get_owc_decoded::<bao1x_api::offsets::common::BootWaitCoding>()
+                );
+                log::info!(
+                    "{:?}",
+                    self.keystore.inc_owc_coded::<bao1x_api::offsets::common::BootWaitCoding>()
+                );
+                log::info!(
+                    "{:?}",
+                    self.keystore.get_owc_decoded::<bao1x_api::offsets::common::BootWaitCoding>()
+                );
             }
             #[cfg(feature = "wfi-stress-test")]
             "wfistress" => {
@@ -726,6 +761,113 @@ impl<'a> ShellCmdApi<'a> for Test {
                     }
                 });
                 write!(ret, "Starting suspend/resume stress test. Hard reboot required to exit.").unwrap();
+            }
+            #[cfg(feature = "qa-test")]
+            "pt0map" => {
+                // This test will print out the L0 page table mapping on older, unpatched versions of the
+                // kernel. Converting the flags from R to R|W would transitively allow a
+                // process to rewrite its page tables which can then lead to all sorts of
+                // chaos.
+                //
+                // On patched kernels, this test should return a BadAddress violation
+                let result = xous::map_memory(
+                    None,
+                    xous::MemoryAddress::new(0xfeff_f000),
+                    0x0040_2000,
+                    xous::MemoryFlags::R,
+                );
+                log::info!("Result: {:x?}", result);
+                if let Ok(m) = result {
+                    log::info!("L0 PT:");
+                    let ms: &[u8] = unsafe { m.as_slice() };
+                    for (i, chunk) in ms[0x40_1000..0x40_1200].chunks(16).enumerate() {
+                        log::info!("{:04x}: {:02x?}", i * 16, chunk);
+                    }
+                }
+            }
+            // ----- below are tests that reproduce a crashing condition in the "bio" implementation -----
+            //
+            // An inelegant work-around was discovered that worked well enough for the conference.
+            // These tests were created by pulling the version of the code that broke and then wrapping some
+            // test sequencing around it. In the end, the issue was discovered to be a problem in
+            // how large keys are handled in the PDDB. This is now patched, but this code is kept
+            // around for reference. Should be fine to cull in a few months (2027 sometime) if
+            // it's still there, as we'll have seen more edge cases work the code base by then.
+            #[cfg(feature = "pddb-test")]
+            "clear" => {
+                let pddb = pddb::Pddb::new();
+                pddb.delete_key(DC34_DICT, TEST_BIO, None).ok();
+                pddb.delete_key(DC34_DICT, TEST_BIO_PINS, None).ok();
+                // make a zero-length placeholder
+                let mut image_key = pddb
+                    .get(DC34_DICT, TEST_BIO, None, true, true, Some(4096), None::<fn()>)
+                    .expect("couldn't get PDDB key");
+                // image_key.write_all(&[0]).ok();
+            }
+            #[cfg(feature = "pddb-test")]
+            "pin" => {
+                let pddb = pddb::Pddb::new();
+                let mut rng = rand::thread_rng();
+                let len: usize = rng.gen_range(1..9);
+                let pins: Vec<u8> = (0..len).map(|_| rng.gen::<u8>()).collect();
+                log::info!("pins: {:?}", pins);
+                let mut pin_key = pddb
+                    .get(DC34_DICT, TEST_BIO_PINS, None, true, true, Some(4), None::<fn()>)
+                    .expect("couldn't get PDDB key");
+                pin_key.write_all(&pins).ok();
+            }
+            #[cfg(feature = "pddb-test")]
+            "clk" => {
+                let pddb = pddb::Pddb::new();
+                let mut rng = rand::thread_rng();
+                let clk: u32 = rng.gen();
+                log::info!("clk: {}", clk);
+                let mut clk_key = pddb
+                    .get(DC34_DICT, TEST_BIO_CLK, None, true, true, Some(4), None::<fn()>)
+                    .expect("couldn't get PDDB key");
+                clk_key.write_all(&clk.to_le_bytes()).ok();
+            }
+            #[cfg(feature = "pddb-test")]
+            "code" => {
+                let pddb = pddb::Pddb::new();
+                let mut rng = rand::thread_rng();
+                let len: usize = rng.gen_range(10..200);
+                let code: Vec<u8> = (0..len).map(|_| rng.gen::<u8>()).collect();
+                log::info!("len: {} hash: {:x}", len, checksum(&code));
+                let mut image_key = pddb
+                    .get(DC34_DICT, TEST_BIO, None, true, true, Some(4096), None::<fn()>)
+                    .expect("couldn't get PDDB key");
+                let bytes: &[u8] = bytemuck::cast_slice(&code);
+                log::info!("wrote {:?}", image_key.write_all(bytes).ok());
+            }
+            #[cfg(feature = "pddb-test")]
+            "check" => {
+                let pddb = pddb::Pddb::new();
+                let mut pin_spec = Vec::<u8>::new();
+                let mut key = pddb
+                    .get(DC34_DICT, TEST_BIO_PINS, None, true, true, Some(4), None::<fn()>)
+                    .map_err(|_| "couldn't get PDDB key".to_string())
+                    .unwrap();
+                key.read_to_end(&mut pin_spec).map_err(|_| "couldn't read key".to_string()).unwrap();
+                log::info!("pins: {:?}", pin_spec);
+
+                let mut clk_buf = [0u8; 4];
+                let mut key = pddb
+                    .get(DC34_DICT, TEST_BIO_CLK, None, true, true, Some(4), None::<fn()>)
+                    .map_err(|_| "couldn't get PDDB key".to_string())
+                    .unwrap();
+                let clk_len = key.read(&mut clk_buf).map_err(|_| "couldn't read key".to_string()).unwrap();
+                log::info!("clk: {}/{}", clk_len, u32::from_le_bytes(clk_buf));
+
+                let mut code_buf = Vec::<u8>::new();
+                let mut key = pddb
+                    .get(DC34_DICT, TEST_BIO, None, true, true, Some(4096), None::<fn()>)
+                    .map_err(|_| "couldn't get PDDB key".to_string())
+                    .unwrap();
+                // specific failure: read_to_end fails when this is 0-length.
+                let code_len =
+                    key.read_to_end(&mut code_buf).map_err(|_| "couldn't read key".to_string()).unwrap();
+                log::info!("len {}/{}, hash {:x}", code_len, code_buf.len(), checksum(&code_buf));
             }
             _ => {
                 write!(ret, "{}", helpstring).unwrap();

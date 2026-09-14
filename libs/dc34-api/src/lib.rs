@@ -15,6 +15,7 @@ pub const DC34_IMAGE: &str = "image";
 pub const DC34_BIO: &str = "bio.code";
 pub const DC34_BIO_PINS: &str = "bio.pins";
 pub const DC34_BIO_CLK: &str = "bio.clk";
+pub const DC34_KEYMAP: &str = "keymap";
 
 pub const SERVER_NAME_VAULT2: &str = "_Vault2_";
 
@@ -22,6 +23,10 @@ pub const SERVER_NAME_VAULT2: &str = "_Vault2_";
 /// can only be run in the factory: once this is greater than 0, the operations
 /// are disabled. 128 is the beginning of the 'application' range for OWC.
 pub const FACTORY_ONE_WAY: usize = 128;
+
+/// Flags if FIDO has be re-inited. This is an option users can invoke to
+/// regenerate their FIDO secrets with corrected TRNG seeding code.
+pub const FIDO_REINIT: usize = 129;
 
 // chosen by fair dice roll. guaranteed to be random.
 pub const DC34_HEADER: [u8; 16] = hex!("49db7671 f34435ed 5fddffdf cbb7508a");
