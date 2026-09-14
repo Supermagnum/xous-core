@@ -80,8 +80,9 @@ pub fn setup_backup_region(fclk_freq: u32) -> u32 {
         bu_mgr.make_valid();
 
         // setup the BIO, so the reset can also clear its registers and state for a clean BDMA pipeline
+        // .init() is implicit in the bao1x_hal version of the API, so we don't have to call it explicitly
         let mut bio_ss = bao1x_hal::bio_hw::BioSharedState::new(fclk_freq);
-        bio_ss.init();
+
         // must disable DMA filtering
         bio_ss.bio.rmwf(utra::bio_bdma::SFR_CONFIG_DISABLE_FILTER_MEM, 1);
         bio_ss.bio.rmwf(utra::bio_bdma::SFR_CONFIG_DISABLE_FILTER_PERI, 1);
