@@ -1,6 +1,9 @@
 // Tetris - all seven standard pieces, 4-way rotation (simplified wall-kick, no full SRS
 // kick table), 7-bag randomization, a score counter, a side-mounted HUD (score + next-piece
 // preview), and a flash animation for row clears.
+//
+// Vendored into Xous by bunnie via https://github.com/bunnie/dc34-vault/pull/3
+// Code contributed by https://github.com/merrittlj
 
 use core::fmt::Write;
 use std::collections::VecDeque;
