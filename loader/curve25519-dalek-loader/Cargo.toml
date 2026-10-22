@@ -33,7 +33,7 @@ sha2-loader = { version = "0.9", default-features = false, path = "../sha2-loade
 bincode = "1"
 criterion = "0.3.0"
 hex = "0.4.2"
-rand = "0.7"
+rand = "0.10"
 
 [[bench]]
 name = "dalek_benchmarks"
